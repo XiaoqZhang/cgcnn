@@ -101,11 +101,12 @@ def collate_pool(dataset_list):
     ----------
 
     dataset_list: list of tuples for each data point.
-      (atom_fea, nbr_fea, nbr_fea_idx, target)
+      (atom_fea, nbr_fea, nbr_fea_idx, glb_fea, target)
 
       atom_fea: torch.Tensor shape (n_i, atom_fea_len)
       nbr_fea: torch.Tensor shape (n_i, M, nbr_fea_len)
       nbr_fea_idx: torch.LongTensor shape (n_i, M)
+      glb_fea: torch.Tensor shape(glb_fea_len)
       target: torch.Tensor shape (1, )
       cif_id: str or int
 
@@ -119,22 +120,25 @@ def collate_pool(dataset_list):
       Bond features of each atom's M neighbors
     batch_nbr_fea_idx: torch.LongTensor shape (N, M)
       Indices of M neighbors of each atom
+    batch_glb_fea: torch.Tensor shape (glb_fea_len)
+      Global features of the crystal
     crystal_atom_idx: list of torch.LongTensor of length N0
       Mapping from the crystal idx to atom idx
     target: torch.Tensor shape (N, 1)
       Target value for prediction
     batch_cif_ids: list
     """
-    batch_atom_fea, batch_nbr_fea, batch_nbr_fea_idx = [], [], []
+    batch_atom_fea, batch_nbr_fea, batch_nbr_fea_idx, batch_glb_fea = [], [], [], []
     crystal_atom_idx, batch_target = [], []
     batch_cif_ids = []
     base_idx = 0
-    for i, ((atom_fea, nbr_fea, nbr_fea_idx), target, cif_id)\
+    for i, ((atom_fea, nbr_fea, nbr_fea_idx, glb_fea), target, cif_id)\
             in enumerate(dataset_list):
         n_i = atom_fea.shape[0]  # number of atoms for this crystal
         batch_atom_fea.append(atom_fea)
         batch_nbr_fea.append(nbr_fea)
         batch_nbr_fea_idx.append(nbr_fea_idx+base_idx)
+        batch_glb_fea.append(glb_fea)
         new_idx = torch.LongTensor(np.arange(n_i)+base_idx)
         crystal_atom_idx.append(new_idx)
         batch_target.append(target)
@@ -143,6 +147,7 @@ def collate_pool(dataset_list):
     return (torch.cat(batch_atom_fea, dim=0),
             torch.cat(batch_nbr_fea, dim=0),
             torch.cat(batch_nbr_fea_idx, dim=0),
+            torch.stack(batch_glb_fea, dim=0),
             crystal_atom_idx),\
         torch.stack(batch_target, dim=0),\
         batch_cif_ids
@@ -257,6 +262,7 @@ class CIFData(Dataset):
 
     root_dir
     ├── id_prop.csv
+    ├── id_fea.csv     # add global feature file
     ├── atom_init.json
     ├── id0.cif
     ├── id1.cif
@@ -265,6 +271,9 @@ class CIFData(Dataset):
     id_prop.csv: a CSV file with two columns. The first column recodes a
     unique ID for each crystal, and the second column recodes the value of
     target property.
+    
+    id_fea.csv: a CSV file stores the unique ID for each crystal in the first 
+    column and global features in other columns. 
 
     atom_init.json: a JSON file that stores the initialization vector for each
     element.
@@ -293,9 +302,12 @@ class CIFData(Dataset):
     Returns
     -------
 
-    atom_fea: torch.Tensor shape (n_i, atom_fea_len)
-    nbr_fea: torch.Tensor shape (n_i, M, nbr_fea_len)
+    atom_fea: torch.Tensor shape (n_i, atom_fea_len)  
+                    # n_i = the number of atoms in the unit cell
+    nbr_fea: torch.Tensor shape (n_i, M, nbr_fea_len) 
+                    # M = max_num_nbr(12), nbr_fea_len = ((dmax-dmin)/step) (12)
     nbr_fea_idx: torch.LongTensor shape (n_i, M)
+    glb_fea: torch.Tensor shape(glb_fea_len)     # return global features
     target: torch.Tensor shape (1, )
     cif_id: str or int
     """
@@ -314,6 +326,14 @@ class CIFData(Dataset):
                                   for x in row] for row in reader]
         random.seed(random_seed)
         random.shuffle(self.id_prop_data)
+        """
+        # read global feature data
+        id_fea_file = os.path.join(self.root_dir, 'id_fea.csv')
+        with open(id_fea_file) as ff:
+            reader = csv.reader(ff)
+            self.id_fea_data = [[x.strip().replace('\ufeff', '')
+                                  for x in row] for row in reader]
+        """
         atom_init_file = os.path.join(self.root_dir, 'atom_init.json')
         assert os.path.exists(atom_init_file), 'atom_init.json does not exist!'
         self.ari = AtomCustomJSONInitializer(atom_init_file)
@@ -325,9 +345,10 @@ class CIFData(Dataset):
 
     @functools.lru_cache(maxsize=None)  # Cache loaded structures
     def __getitem__(self, idx):
-        cif_id, target = self.id_prop_data[idx]
+        cif_id, target, *glb_fea = self.id_prop_data[idx]
         cif_id = cif_id.replace('ï»¿', '')
         target = torch.Tensor([float(target)])
+        glb_fea = torch.Tensor([float(i) for i in glb_fea])
 
         if os.path.exists(os.path.join(self.torch_data_path, cif_id+'.pkl')):
             with open(os.path.join(self.torch_data_path, cif_id+'.pkl'), 'rb') as f:
@@ -335,17 +356,21 @@ class CIFData(Dataset):
                 atom_fea = pkl_data[0]
                 nbr_fea = pkl_data[1]
                 nbr_fea_idx = pkl_data[2]
+                glb_fea = pkl_data[3]
         else:
             crystal = Structure.from_file(os.path.join(self.root_dir,
                                                        cif_id+'.cif'))
             atom_fea = np.vstack([self.ari.get_atom_fea(crystal[i].specie.number)
                                   for i in range(len(crystal))])
+            # len(crystal) equals the number of atoms in the unit cell
             atom_fea = torch.Tensor(atom_fea)
             all_nbrs = crystal.get_all_neighbors(
                 self.radius, include_index=True)
             all_nbrs = [sorted(nbrs, key=lambda x: x[1]) for nbrs in all_nbrs]
+            # sorted according to the distance
             nbr_fea_idx, nbr_fea = [], []
             for nbr in all_nbrs:
+                # select the nearest 12 nbr atoms
                 if len(nbr) < self.max_num_nbr:
                     warnings.warn('{} not find enough neighbors to build graph. '
                                   'If it happens frequently, consider increase '
@@ -365,9 +390,10 @@ class CIFData(Dataset):
             atom_fea = torch.Tensor(atom_fea)
             nbr_fea = torch.Tensor(nbr_fea)
             nbr_fea_idx = torch.LongTensor(nbr_fea_idx)
+            
             if not self.disable_save_torch:
                 with open(os.path.join(self.torch_data_path, cif_id+'.pkl'), 'wb') as f:
                     pickle.dump(
-                        (atom_fea, nbr_fea, nbr_fea_idx), f)
+                        (atom_fea, nbr_fea, nbr_fea_idx, glb_fea), f)
 
-        return (atom_fea, nbr_fea, nbr_fea_idx), target, cif_id
+        return (atom_fea, nbr_fea, nbr_fea_idx, glb_fea), target, cif_id

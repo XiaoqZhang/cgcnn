@@ -79,7 +79,7 @@ class CrystalGraphConvNet(nn.Module):
     material properties.
     """
 
-    def __init__(self, orig_atom_fea_len, nbr_fea_len,
+    def __init__(self, orig_atom_fea_len, nbr_fea_len, glb_fea_len, 
                  atom_fea_len=64, n_conv=3, h_fea_len=128, n_h=1,
                  classification=False):
         """
@@ -109,6 +109,7 @@ class CrystalGraphConvNet(nn.Module):
                                     for _ in range(n_conv)])
         self.conv_to_fc = nn.Linear(atom_fea_len, h_fea_len)
         self.conv_to_fc_softplus = nn.Softplus()
+        self.norm = nn.BatchNorm1d(h_fea_len+glb_fea_len)
         if n_h > 1:
             self.fcs = nn.ModuleList([nn.Linear(h_fea_len, h_fea_len)
                                       for _ in range(n_h-1)])
@@ -121,8 +122,12 @@ class CrystalGraphConvNet(nn.Module):
         if self.classification:
             self.logsoftmax = nn.LogSoftmax(dim=1)
             self.dropout = nn.Dropout()
+        if self.classification:
+            self.fc_out_out = nn.Linear(h_fea_len+glb_fea_len, 2)
+        else:
+            self.fc_out_out = nn.Linear(h_fea_len+glb_fea_len, 1)
 
-    def forward(self, atom_fea, nbr_fea, nbr_fea_idx, crystal_atom_idx):
+    def forward(self, atom_fea, nbr_fea, nbr_fea_idx, glb_fea, crystal_atom_idx):
         """
         Forward pass
 
@@ -141,6 +146,8 @@ class CrystalGraphConvNet(nn.Module):
           Indices of M neighbors of each atom
         crystal_atom_idx: list of torch.LongTensor of length N0
           Mapping from the crystal idx to atom idx
+        glb_fea : Variable(torch.Tensor) shape(N0, glb_fea_len)
+          Global features of batch crystals
 
         Returns
         -------
@@ -152,15 +159,20 @@ class CrystalGraphConvNet(nn.Module):
         atom_fea = self.embedding(atom_fea)
         for conv_func in self.convs:
             atom_fea = conv_func(atom_fea, nbr_fea, nbr_fea_idx)
+        
         crys_fea = self.pooling(atom_fea, crystal_atom_idx)
         crys_fea = self.conv_to_fc(self.conv_to_fc_softplus(crys_fea))
-        crys_fea = self.conv_to_fc_softplus(crys_fea)
+        all_fea = torch.cat([crys_fea, glb_fea], dim=1)
+        all_fea = self.norm(all_fea)
+        all_fea = self.conv_to_fc_softplus(all_fea)
+
         if self.classification:
-            crys_fea = self.dropout(crys_fea)
+            all_fea = self.dropout(all_fea)
         if hasattr(self, 'fcs') and hasattr(self, 'softpluses'):
             for fc, softplus in zip(self.fcs, self.softpluses):
-                crys_fea = softplus(fc(crys_fea))
-        out = self.fc_out(crys_fea)
+                all_fea = softplus(fc(all_fea))
+        #out = self.fc_out(crys_fea)
+        out = self.fc_out_out(all_fea)
         if self.classification:
             out = self.logsoftmax(out)
         return out
